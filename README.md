@@ -5,7 +5,7 @@ Minimal relay-based encrypted overlay network.
 This workspace contains:
 
 - `sn-relay`: UDP relay server (star topology)
-- `sn-client`: Linux client that creates a TUN device and tunnels IPv4 packets through the relay
+- `sn-client`: client that creates a TUN device and tunnels IPv4 packets through the relay (Linux/macOS)
 - `sn-proto`: wire format + crypto helpers
 
 ## How it works
@@ -35,7 +35,9 @@ In `sn-client` config:
 - `server` (string): UDP relay address, e.g. `"1.2.3.4:41641"`
 - `node_id` (UUID string): unique per node
 - `virtual_ip` (IPv4 string): IP assigned to the node on the overlay
-- `tun` (string): TUN device name, e.g. `sn0`
+- `tun` (string): TUN device name.
+	- Linux: an arbitrary name like `sn0`
+	- macOS: use `utun`, `utunX`, or `auto` (macOS does not accept arbitrary names)
 - `psk_base64` (base64 string): 32-byte shared secret (must match relay)
 - `peers` (table): map `"10.0.0.X" = "<peer uuid>"`
 - `netmask` (optional, IPv4 string): defaults to `255.255.255.0` (`/24`)
@@ -76,6 +78,13 @@ sudo RUST_LOG=info ./target/release/sn-client run --config configs/client.exampl
 ```bash
 ip addr show dev sn0
 ip route get 10.0.0.2
+```
+
+On macOS you can use:
+
+```bash
+ifconfig | grep -E "^utun"
+route -n get 10.0.0.2
 ```
 
 ## Troubleshooting

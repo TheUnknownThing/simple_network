@@ -126,13 +126,31 @@ fn run(config_path: &str) -> Result<()> {
     // A conservative default avoids fragmentation/blackholing for larger TCP transfers.
     let mtu: i32 = cfg.mtu.unwrap_or(1280) as i32;
 
-    // TUN setup (Linux).
+    // TUN setup.
+    // Note: macOS uses `utun*` devices and does not accept arbitrary interface names.
+    // If a non-utun name is provided (e.g. "sn0"), we let the OS auto-allocate.
     let mut tun = tun::Configuration::default();
-    tun.name(&cfg.tun)
-        .address(virt_ip)
-        .netmask(netmask)
-        .mtu(mtu)
-        .up();
+
+    #[cfg(target_os = "macos")]
+    {
+        let requested = cfg.tun.trim();
+        if !requested.is_empty() && requested != "auto" {
+            if requested == "utun" || requested.starts_with("utun") {
+                tun.name(requested);
+            } else {
+                eprintln!(
+                    "warn: ignoring tun name '{requested}' on macOS; use 'utun', 'utunX', or 'auto'"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        tun.name(&cfg.tun);
+    }
+
+    tun.address(virt_ip).netmask(netmask).mtu(mtu).up();
 
     let dev = tun::create(&tun).context("creating TUN device")?;
     let (mut tun_reader, mut tun_writer) = dev.split();
