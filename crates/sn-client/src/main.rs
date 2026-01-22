@@ -13,6 +13,59 @@ use sn_proto::wire::{
     WirePacket, WIRE_VERSION,
 };
 
+use tun::Device as _;
+
+#[cfg(target_os = "macos")]
+fn macos_pi_header_for_ipv4() -> [u8; 4] {
+    // tun crate encodes PI as: flags (u16 native endian) + protocol (u16 network endian).
+    // flags is always 0, protocol for IPv4 on macOS is PF_INET (2).
+    [0, 0, 0, 2]
+}
+
+#[cfg(target_os = "macos")]
+fn ipv4_to_u32(ip: std::net::Ipv4Addr) -> u32 {
+    u32::from_be_bytes(ip.octets())
+}
+
+#[cfg(target_os = "macos")]
+fn u32_to_ipv4(v: u32) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(v.to_be_bytes())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ensure_route(dev: &str, virt_ip: std::net::Ipv4Addr, netmask: std::net::Ipv4Addr) -> anyhow::Result<()> {
+    use std::process::Command;
+
+    let network = u32_to_ipv4(ipv4_to_u32(virt_ip) & ipv4_to_u32(netmask));
+    let out = Command::new("/sbin/route")
+        .args([
+            "-n",
+            "add",
+            "-net",
+            &network.to_string(),
+            "-netmask",
+            &netmask.to_string(),
+            "-interface",
+            dev,
+        ])
+        .output()
+        .context("running /sbin/route to add overlay route")?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    // If the route already exists, consider it success.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stdout}{stderr}");
+    if combined.contains("File exists") || combined.contains("exists") {
+        return Ok(());
+    }
+
+    anyhow::bail!("route add failed: {combined}");
+}
+
 #[derive(Debug, Deserialize)]
 struct ClientConfig {
     server: String,
@@ -150,9 +203,27 @@ fn run(config_path: &str) -> Result<()> {
         tun.name(&cfg.tun);
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        // utun is point-to-point; setting a destination avoids odd defaults.
+        tun.destination(virt_ip);
+    }
+
     tun.address(virt_ip).netmask(netmask).mtu(mtu).up();
 
     let dev = tun::create(&tun).context("creating TUN device")?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let dev_name = dev.name().unwrap_or_else(|_| "(unknown)".to_string());
+        // Ensure overlay destinations route into utun, not the default gateway.
+        if dev_name != "(unknown)" {
+            if let Err(e) = macos_ensure_route(&dev_name, virt_ip, netmask) {
+                eprintln!("warn: failed to add route for overlay via {dev_name}: {e:#}");
+            }
+        }
+    }
+
     let (mut tun_reader, mut tun_writer) = dev.split();
 
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").context("binding UDP")?;
@@ -184,7 +255,20 @@ fn run(config_path: &str) -> Result<()> {
         loop {
             match tun_reader.read(&mut buf) {
                 Ok(n) if n > 0 => {
-                    if tun_tx.send(buf[..n].to_vec()).is_err() {
+                    #[cfg(target_os = "macos")]
+                    let pkt = {
+                        // On macOS, utun always includes a 4-byte packet information header.
+                        // Strip it so the rest of the code and the on-wire format stay as raw IPv4.
+                        if n <= 4 {
+                            continue;
+                        }
+                        buf[4..n].to_vec()
+                    };
+
+                    #[cfg(not(target_os = "macos"))]
+                    let pkt = buf[..n].to_vec();
+
+                    if tun_tx.send(pkt).is_err() {
                         break;
                     }
                 }
@@ -196,7 +280,20 @@ fn run(config_path: &str) -> Result<()> {
 
     std::thread::spawn(move || {
         while let Ok(pkt) = net_rx.recv() {
-            let _ = tun_writer.write_all(&pkt);
+            #[cfg(target_os = "macos")]
+            {
+                // utun expects the 4-byte packet information header.
+                // We only tunnel IPv4 packets, so always tag as PF_INET.
+                let mut framed = Vec::with_capacity(4 + pkt.len());
+                framed.extend_from_slice(&macos_pi_header_for_ipv4());
+                framed.extend_from_slice(&pkt);
+                let _ = tun_writer.write_all(&framed);
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = tun_writer.write_all(&pkt);
+            }
         }
     });
 
