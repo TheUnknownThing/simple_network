@@ -1,0 +1,35 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Cargo build artifacts (rare)
+Cargo.lock.bk
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+*.log
+.vscode/
+.idea/
+
+# Tooling caches
+.fleet/
+.rust-analyzer/
+
+# Local configs (keep *.example.toml committed)
+/configs/*.toml
+!/configs/*.example.toml
+
+# Secrets / keys (if you add them later)
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+.env
+.env.*
+
+.tools

@@ -1,0 +1,8 @@
+listen = "0.0.0.0:41641"
+# 32 bytes base64. Example only; generate your own:
+psk_base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+# Static registry: node_id (UUID) -> virtual IPv4 address
+[peers]
+"00000000-0000-0000-0000-000000000002" = "10.0.0.2"
+"00000000-0000-0000-0000-000000000003" = "10.0.0.3"

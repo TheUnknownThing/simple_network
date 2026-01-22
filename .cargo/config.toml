@@ -1,0 +1,25 @@
+[term]
+verbose = false
+
+# Example target config (adjust linker to your toolchain).
+#
+# For OpenWrt SDK, you typically have something like:
+#   staging_dir/toolchain-*/bin/mipsel-openwrt-linux-musl-gcc
+#
+# Uncomment and set the correct path on your machine.
+#
+# [target.mipsel-unknown-linux-musl]
+# linker = "/absolute/path/to/mipsel-linux-musl-gcc"
+
+# GNU ld / lld size flags (do NOT work with macOS ld64).
+[target.mipsel-unknown-linux-musl]
+rustflags = ["-C", "link-arg=-Wl,--gc-sections"]
+
+[target.mips-unknown-linux-musl]
+rustflags = ["-C", "link-arg=-Wl,--gc-sections"]
+
+[target.mipsel-unknown-linux-uclibc]
+rustflags = ["-C", "link-arg=-Wl,--gc-sections"]
+
+[target.mips-unknown-linux-uclibc]
+rustflags = ["-C", "link-arg=-Wl,--gc-sections"]
