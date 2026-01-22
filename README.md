@@ -109,19 +109,35 @@ Many router UIs redirect to a different host/IP after auth (sometimes their LAN 
 - Cross compiling Rust to MIPS32 is possible; you’ll typically use `mipsel-unknown-linux-musl` (little-endian) for many OpenWrt targets.
 - Release profile is already size-optimized (`opt-level=z`, `lto`, `strip`, `panic=abort`).
 
-### Build for MIPS32 (macOS)
+### Build flow (MIPS32)
 
-Recommended: use `cross` (Docker-based) so you don’t have to set up a MIPS toolchain on macOS.
+This repo’s helper script prefers:
+
+1) `cross` (Docker-based) if available
+2) otherwise `cargo-zigbuild` + Zig + `nightly` + `-Z build-std` (does not require Docker)
+
+The fallback is necessary because `rust-std` for `mipsel-unknown-linux-musl` isn’t available on stable, so the script builds `std` from source.
+
+### Build for MIPS32
+
+Build `sn-client`:
 
 ```bash
-rustup target add mipsel-unknown-linux-musl
-
-# Install cross once (takes a bit)
-cargo install cross --git https://github.com/cross-rs/cross
-
-# Build the tiny client
 ./scripts/build-mips32.sh mipsel-unknown-linux-musl sn-client
 ```
+
+Build `sn-relay`:
+
+```bash
+./scripts/build-mips32.sh mipsel-unknown-linux-musl sn-relay
+```
+
+Outputs land in `target/<target>/release/<pkg>`.
+
+Notes:
+
+- If you have Docker + `cross` installed, the script will use it automatically.
+- If not, the script will use `cargo-zigbuild` and will add the required `-msoft-float` linker arg for MIPS32.
 
 Alternative: OpenWrt SDK toolchain.
 
@@ -130,7 +146,6 @@ Alternative: OpenWrt SDK toolchain.
 - Then run:
 
 ```bash
-rustup target add mipsel-unknown-linux-musl
 cargo build --release --target mipsel-unknown-linux-musl -p sn-client
 ```
 
