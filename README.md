@@ -12,21 +12,23 @@ This workspace contains:
 
 - Each client creates a TUN interface (e.g. `sn0`) with a **virtual IPv4** like `10.0.0.2`.
 - When the OS sends a packet to some virtual destination (e.g. `10.0.0.3`), the client reads it from the TUN device.
-- The client wraps that packet in an encrypted message and sends it via UDP to the relay.
-- The relay tracks the UDP source address of each node (learned from incoming packets / registration), then forwards traffic to the destination node.
+- The client wraps that packet in an end-to-end encrypted message and sends it via UDP to the relay.
+- The relay tracks the UDP source address of each node (learned from authenticated registration) and forwards traffic to the destination node **without decrypting**.
 
-### Important security note
+### Security note
 
-This is **not end-to-end encryption** between clients. The relay decrypts packets from the source node and re-encrypts them for the destination node.
+Data-plane traffic is end-to-end encrypted between clients (the relay only forwards opaque ciphertext).
+
+The control-plane (registration, keepalive, peer discovery) is encrypted client <-> relay.
 
 ## Configuration model
 
-Configuration is static (TOML):
+Configuration is mostly static (TOML):
 
 - Relay config contains a registry mapping `node_id -> virtual_ip`.
-- Client config contains a routing table mapping `virtual_ip -> node_id`.
+- Clients do not need a static routing table; they can resolve `virtual_ip -> node_id` on-demand through the relay.
 
-The repo includes `configs/*.example.toml`. Local configs (with real PSKs / endpoints) are ignored by `.gitignore`.
+The repo includes `configs/*.example.toml`.
 
 ### Client config fields
 
@@ -38,8 +40,8 @@ In `sn-client` config:
 - `tun` (string): TUN device name.
 	- Linux: an arbitrary name like `sn0`
 	- macOS: use `utun`, `utunX`, or `auto` (macOS does not accept arbitrary names)
-- `psk_base64` (base64 string): 32-byte shared secret (must match relay)
-- `peers` (table): map `"10.0.0.X" = "<peer uuid>"`
+- `relay_psk_base64` (base64 string): 32-byte shared secret for relay control-plane (must match relay)
+- `network_psk_base64` (base64 string): 32-byte shared secret for client end-to-end data-plane (relay does not need this)
 - `netmask` (optional, IPv4 string): defaults to `255.255.255.0` (`/24`)
 - `mtu` (optional, u16): defaults to `1280` (conservative; helps avoid blackholing)
 
@@ -48,7 +50,7 @@ In `sn-client` config:
 In `sn-relay` config:
 
 - `listen` (string): UDP bind address, e.g. `"0.0.0.0:41641"`
-- `psk_base64` (base64 string): 32-byte shared secret (must match clients)
+- `relay_psk_base64` (base64 string): 32-byte shared secret for relay control-plane (must match clients)
 - `peers` (table): map `"<peer uuid>" = "10.0.0.X"`
 
 ## Build
@@ -60,6 +62,10 @@ cargo build --release
 ## Run (quickstart)
 
 1) Pick a PSK (32 bytes, base64). Put the same value in relay + all clients.
+
+```bash
+openssl rand -base64 32
+```
 
 2) Start relay:
 
@@ -118,15 +124,6 @@ Many router UIs redirect to a different host/IP after auth (sometimes their LAN 
 - Cross compiling Rust to MIPS32 is possible; you’ll typically use `mipsel-unknown-linux-musl` (little-endian) for many OpenWrt targets.
 - Release profile is already size-optimized (`opt-level=z`, `lto`, `strip`, `panic=abort`).
 
-### Build flow (MIPS32)
-
-This repo’s helper script prefers:
-
-1) `cross` (Docker-based) if available
-2) otherwise `cargo-zigbuild` + Zig + `nightly` + `-Z build-std` (does not require Docker)
-
-The fallback is necessary because `rust-std` for `mipsel-unknown-linux-musl` isn’t available on stable, so the script builds `std` from source.
-
 ### Build for MIPS32
 
 Build `sn-client`:
@@ -148,13 +145,4 @@ Notes:
 - If you have Docker + `cross` installed, the script will use it automatically.
 - If not, the script will use `cargo-zigbuild` and will add the required `-msoft-float` linker arg for MIPS32.
 
-Alternative: OpenWrt SDK toolchain.
-
-- Point the Rust target linker in `.cargo/config.toml`:
-	- `linker = "/path/to/mipsel-openwrt-linux-musl-gcc"`
-- Then run:
-
-```bash
-cargo build --release --target mipsel-unknown-linux-musl -p sn-client
-```
 

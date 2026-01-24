@@ -46,6 +46,29 @@ pub fn derive_node_key(psk: &[u8; 32], node_id: NodeId) -> [u8; 32] {
     okm
 }
 
+pub fn derive_e2e_key(network_psk: &[u8; 32], src: NodeId, dst: NodeId) -> [u8; 32] {
+    // Symmetric pairwise key so both endpoints derive the same bytes.
+    // HKDF(psk, info = "sn/e2e-key" || min(src,dst) || max(src,dst))
+    let hk = Hkdf::<Sha256>::new(None, network_psk);
+    let mut okm = [0u8; 32];
+
+    let (a, b) = if src.as_bytes() <= dst.as_bytes() {
+        (src, dst)
+    } else {
+        (dst, src)
+    };
+
+    let mut info = Vec::with_capacity(b"sn/e2e-key".len() + 16 + 16);
+    info.extend_from_slice(b"sn/e2e-key");
+    info.extend_from_slice(a.as_bytes());
+    info.extend_from_slice(b.as_bytes());
+
+    hk.expand(&info, &mut okm)
+        .expect("HKDF expand must not fail for 32-byte okm");
+
+    okm
+}
+
 pub fn seal(
     node_key: &[u8; 32],
     nonce12: &[u8; 12],

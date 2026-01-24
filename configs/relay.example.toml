@@ -1,6 +1,6 @@
 listen = "0.0.0.0:41641"
 # 32 bytes base64. Example only; generate your own:
-psk_base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+relay_psk_base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 # Static registry: node_id (UUID) -> virtual IPv4 address
 [peers]

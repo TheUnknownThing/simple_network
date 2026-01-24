@@ -7,13 +7,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use sn_proto::crypto::{decode_psk_base64, derive_node_key, open, random_nonce12, seal};
+use sn_proto::crypto::{decode_psk_base64, derive_e2e_key, derive_node_key, open, random_nonce12, seal};
 use sn_proto::wire::{
-    decode_inner, decode_wire, encode_inner, encode_wire, Inner, Ipv4AddrBytes, MsgType, NodeId,
-    WirePacket, WIRE_VERSION,
+    decode_control, decode_wire, encode_control, encode_wire, Control, Ipv4AddrBytes, MsgType,
+    NodeId, WirePacket, WIRE_VERSION,
 };
-
-use tun::Device as _;
 
 #[cfg(target_os = "macos")]
 fn macos_pi_header_for_ipv4() -> [u8; 4] {
@@ -76,8 +74,11 @@ struct ClientConfig {
     #[serde(default)]
     mtu: Option<u16>,
     tun: String,
-    psk_base64: String,
-    peers: HashMap<String, String>, // ip -> node_id
+    #[serde(alias = "psk_base64")]
+    relay_psk_base64: String,
+    /// Optional. If omitted, falls back to relay_psk_base64 (reduces E2E security).
+    #[serde(default)]
+    network_psk_base64: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -155,18 +156,20 @@ fn run(config_path: &str) -> Result<()> {
 
     let virt_ip: std::net::Ipv4Addr = cfg.virtual_ip.parse().context("parsing virtual_ip")?;
 
-    let mut peer_by_ip: HashMap<std::net::Ipv4Addr, NodeId> = HashMap::new();
-    for (ip_str, node_str) in cfg.peers.iter() {
-        let ip: std::net::Ipv4Addr = ip_str
-            .parse()
-            .with_context(|| format!("bad peer ip {ip_str}"))?;
-        let node_uuid = uuid::Uuid::parse_str(node_str)
-            .with_context(|| format!("bad peer node_id {node_str}"))?;
-        peer_by_ip.insert(ip, NodeId(node_uuid));
-    }
+    let mut node_by_ip: HashMap<std::net::Ipv4Addr, NodeId> = HashMap::new();
 
-    let psk = decode_psk_base64(&cfg.psk_base64).context("invalid psk_base64")?;
-    let node_key = derive_node_key(&psk, node_id);
+    let relay_psk = decode_psk_base64(&cfg.relay_psk_base64).context("invalid relay_psk_base64")?;
+    let network_psk = match cfg.network_psk_base64.as_deref() {
+        Some(v) => decode_psk_base64(v).context("invalid network_psk_base64")?,
+        None => {
+            eprintln!(
+                "warn: network_psk_base64 not set; falling back to relay_psk_base64 (not true E2E)"
+            );
+            relay_psk
+        }
+    };
+
+    let node_key = derive_node_key(&relay_psk, node_id);
 
     let netmask: std::net::Ipv4Addr = cfg
         .netmask
@@ -236,12 +239,12 @@ fn run(config_path: &str) -> Result<()> {
     );
 
     // Register.
-    send_inner(
+    send_control(
         &sock,
         node_id,
         NodeId(uuid::Uuid::nil()),
         &node_key,
-        Inner::Register {
+        Control::Register {
             virtual_ip: Ipv4AddrBytes::from_std(virt_ip),
         },
     )?;
@@ -300,15 +303,20 @@ fn run(config_path: &str) -> Result<()> {
     let mut udp_buf = vec![0u8; 2048];
     let mut next_keepalive = Instant::now() + Duration::from_secs(20);
 
+    let mut pending_by_ip: HashMap<std::net::Ipv4Addr, Vec<Vec<u8>>> = HashMap::new();
+    let mut last_resolve_sent: HashMap<std::net::Ipv4Addr, Instant> = HashMap::new();
+    const MAX_PENDING_PER_IP: usize = 16;
+    const RESOLVE_RETRY: Duration = Duration::from_secs(2);
+
     loop {
         // Keepalive.
         if Instant::now() >= next_keepalive {
-            let _ = send_inner(
+            let _ = send_control(
                 &sock,
                 node_id,
                 NodeId(uuid::Uuid::nil()),
                 &node_key,
-                Inner::Keepalive,
+                Control::Keepalive,
             );
             next_keepalive = Instant::now() + Duration::from_secs(20);
         }
@@ -320,28 +328,51 @@ fn run(config_path: &str) -> Result<()> {
                 continue;
             }
             let dst_ip = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-            let dst_node = match peer_by_ip.get(&dst_ip) {
-                Some(n) => *n,
-                None => {
-                    if is_debug() {
-                        eprintln!("debug: no peer mapping for dst={dst_ip}");
-                    }
-                    continue;
-                }
+
+            if let Some(dst_node) = node_by_ip.get(&dst_ip).copied() {
+                send_data(&sock, node_id, dst_node, &network_psk, &pkt)?;
+                continue;
+            }
+
+            let entry = pending_by_ip.entry(dst_ip).or_default();
+            if entry.len() < MAX_PENDING_PER_IP {
+                entry.push(pkt);
+            } else if is_debug() {
+                eprintln!("debug: pending queue full for dst={dst_ip}");
+            }
+
+            let now = Instant::now();
+            let should_send = match last_resolve_sent.get(&dst_ip) {
+                Some(t) => now.duration_since(*t) >= RESOLVE_RETRY,
+                None => true,
             };
-            send_inner(
-                &sock,
-                node_id,
-                dst_node,
-                &node_key,
-                Inner::Data { payload: pkt },
-            )?;
+            if should_send {
+                let _ = send_control(
+                    &sock,
+                    node_id,
+                    NodeId(uuid::Uuid::nil()),
+                    &node_key,
+                    Control::Resolve {
+                        virtual_ip: Ipv4AddrBytes::from_std(dst_ip),
+                    },
+                );
+                last_resolve_sent.insert(dst_ip, now);
+            }
         }
 
         // UDP receive.
         match sock.recv(&mut udp_buf) {
             Ok(n) => {
-                if let Err(e) = handle_inbound(&udp_buf[..n], node_id, &node_key, &net_tx) {
+                if let Err(e) = handle_inbound(
+                    &sock,
+                    &udp_buf[..n],
+                    node_id,
+                    &node_key,
+                    &network_psk,
+                    &net_tx,
+                    &mut node_by_ip,
+                    &mut pending_by_ip,
+                ) {
                     if is_debug() {
                         eprintln!("debug: drop inbound: {e:#}");
                     }
@@ -359,47 +390,105 @@ fn run(config_path: &str) -> Result<()> {
 }
 
 fn handle_inbound(
+    sock: &std::net::UdpSocket,
     bytes: &[u8],
     node_id: NodeId,
     node_key: &[u8; 32],
+    network_psk: &[u8; 32],
     net_tx: &mpsc::SyncSender<Vec<u8>>,
+    node_by_ip: &mut HashMap<std::net::Ipv4Addr, NodeId>,
+    pending_by_ip: &mut HashMap<std::net::Ipv4Addr, Vec<Vec<u8>>>,
 ) -> Result<()> {
     let pkt = decode_wire(bytes).context("decode wire")?;
-    if pkt.v != WIRE_VERSION || pkt.t != MsgType::Encrypted {
-        anyhow::bail!("unsupported wire");
+    if pkt.v != WIRE_VERSION {
+        anyhow::bail!("unsupported wire version");
     }
     if pkt.dst != node_id {
         anyhow::bail!("not for us");
     }
 
-    let aad = aad_bytes(pkt.v, pkt.t, pkt.src, pkt.dst);
-    let inner_bytes = open(node_key, &pkt.nonce12, &pkt.ciphertext, &aad).context("decrypt")?;
-    let inner = decode_inner(&inner_bytes).context("decode inner")?;
+    match pkt.t {
+        MsgType::Control => {
+            let aad = aad_bytes(pkt.v, pkt.t, pkt.src, pkt.dst);
+            let pt = open(node_key, &pkt.nonce12, &pkt.ciphertext, &aad).context("decrypt control")?;
+            let ctrl = decode_control(&pt).context("decode control")?;
 
-    match inner {
-        Inner::Data { payload } => {
+            match ctrl {
+                Control::ResolveOk { virtual_ip, node_id: peer } => {
+                    let ip = virtual_ip.to_std();
+                    node_by_ip.insert(ip, peer);
+
+                    if let Some(mut queued) = pending_by_ip.remove(&ip) {
+                        for pkt in queued.drain(..) {
+                            let _ = send_data(sock, node_id, peer, network_psk, &pkt);
+                        }
+                    }
+                    Ok(())
+                }
+                Control::ResolveErr { virtual_ip } => {
+                    if is_debug() {
+                        eprintln!("debug: resolve failed for dst={}", virtual_ip.to_std());
+                    }
+                    pending_by_ip.remove(&virtual_ip.to_std());
+                    Ok(())
+                }
+                Control::Keepalive | Control::Register { .. } | Control::Resolve { .. } => Ok(()),
+            }
+        }
+        MsgType::Data => {
+            let e2e_key = derive_e2e_key(network_psk, pkt.src, pkt.dst);
+            let aad = aad_bytes(pkt.v, pkt.t, pkt.src, pkt.dst);
+            let payload = open(&e2e_key, &pkt.nonce12, &pkt.ciphertext, &aad).context("decrypt data")?;
+            if payload.is_empty() {
+                anyhow::bail!("empty payload");
+            }
             net_tx.send(payload).ok();
             Ok(())
         }
-        Inner::Keepalive | Inner::Register { .. } => Ok(()),
     }
 }
 
-fn send_inner(
+fn send_control(
     sock: &std::net::UdpSocket,
     src: NodeId,
     dst: NodeId,
     node_key: &[u8; 32],
-    inner: Inner,
+    ctrl: Control,
 ) -> Result<()> {
-    let inner_bytes = encode_inner(&inner).context("encode inner")?;
+    let inner_bytes = encode_control(&ctrl).context("encode control")?;
     let nonce = random_nonce12();
-    let aad = aad_bytes(WIRE_VERSION, MsgType::Encrypted, src, dst);
+    let aad = aad_bytes(WIRE_VERSION, MsgType::Control, src, dst);
     let ciphertext = seal(node_key, &nonce, &inner_bytes, &aad).context("encrypt")?;
 
     let pkt = WirePacket {
         v: WIRE_VERSION,
-        t: MsgType::Encrypted,
+        t: MsgType::Control,
+        src,
+        dst,
+        nonce12: nonce,
+        ciphertext,
+    };
+
+    let bytes = encode_wire(&pkt).context("encode wire")?;
+    sock.send(&bytes).context("udp send")?;
+    Ok(())
+}
+
+fn send_data(
+    sock: &std::net::UdpSocket,
+    src: NodeId,
+    dst: NodeId,
+    network_psk: &[u8; 32],
+    payload: &[u8],
+) -> Result<()> {
+    let e2e_key = derive_e2e_key(network_psk, src, dst);
+    let nonce = random_nonce12();
+    let aad = aad_bytes(WIRE_VERSION, MsgType::Data, src, dst);
+    let ciphertext = seal(&e2e_key, &nonce, payload, &aad).context("encrypt data")?;
+
+    let pkt = WirePacket {
+        v: WIRE_VERSION,
+        t: MsgType::Data,
         src,
         dst,
         nonce12: nonce,

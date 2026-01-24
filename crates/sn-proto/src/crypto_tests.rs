@@ -13,7 +13,7 @@ mod tests {
         let aad = {
             let mut v = Vec::new();
             v.push(WIRE_VERSION);
-            v.push(MsgType::Encrypted as u8);
+            v.push(MsgType::Control as u8);
             v.extend_from_slice(node_id.as_bytes());
             v.extend_from_slice(node_id.as_bytes());
             v

@@ -7,9 +7,13 @@ tun = "sn0"
 # Optional tuning (recommended when using an Internet relay):
 netmask = "255.255.255.0"
 mtu = 1280
-# 32 bytes base64. Must match relay.
-psk_base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
-# Static routing: virtual IPv4 -> node_id
-[peers]
-"10.0.0.3" = "00000000-0000-0000-0000-000000000003"
+# Relay control-plane secret (32 bytes base64). Must match relay.
+relay_psk_base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+# Client-only network secret for end-to-end data encryption.
+# All clients in the same overlay must share the same value.
+# The relay does NOT need this.
+network_psk_base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+

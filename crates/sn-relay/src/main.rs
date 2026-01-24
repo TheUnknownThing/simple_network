@@ -7,14 +7,15 @@ use serde::Deserialize;
 
 use sn_proto::crypto::{decode_psk_base64, derive_node_key, open, random_nonce12, seal};
 use sn_proto::wire::{
-    decode_inner, decode_wire, encode_inner, encode_wire, Inner, MsgType, NodeId, WirePacket,
-    WIRE_VERSION,
+    decode_control, decode_wire, encode_control, encode_wire, Control, Ipv4AddrBytes, MsgType,
+    NodeId, WirePacket, WIRE_VERSION,
 };
 
 #[derive(Debug, Deserialize)]
 struct RelayConfig {
     listen: String,
-    psk_base64: String,
+    #[serde(alias = "psk_base64")]
+    relay_psk_base64: String,
     peers: HashMap<String, String>,
 }
 
@@ -93,9 +94,10 @@ fn run(config_path: &str) -> Result<()> {
         .with_context(|| format!("reading config {config_path}"))?;
     let cfg: RelayConfig = toml::from_str(&cfg_text).context("parsing relay config")?;
 
-    let psk = decode_psk_base64(&cfg.psk_base64).context("invalid psk_base64")?;
+    let relay_psk = decode_psk_base64(&cfg.relay_psk_base64).context("invalid relay_psk_base64")?;
 
     let mut peers_by_id: HashMap<NodeId, PeerInfo> = HashMap::new();
+    let mut node_by_ip: HashMap<std::net::Ipv4Addr, NodeId> = HashMap::new();
     for (node_str, ip_str) in cfg.peers.iter() {
         let node_uuid = uuid::Uuid::parse_str(node_str)
             .with_context(|| format!("invalid node_id UUID: {node_str}"))?;
@@ -103,7 +105,9 @@ fn run(config_path: &str) -> Result<()> {
         let ip: std::net::Ipv4Addr = ip_str
             .parse()
             .with_context(|| format!("invalid IPv4 for {node_str}: {ip_str}"))?;
-        let key = derive_node_key(&psk, node);
+        let key = derive_node_key(&relay_psk, node);
+
+        node_by_ip.insert(ip, node);
 
         peers_by_id.insert(
             node,
@@ -129,7 +133,14 @@ fn run(config_path: &str) -> Result<()> {
     loop {
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
-                if let Err(e) = handle_packet(&sock, &buf[..n], from, &peers_by_id, &mut endpoints)
+                if let Err(e) = handle_packet(
+                    &sock,
+                    &buf[..n],
+                    from,
+                    &peers_by_id,
+                    &node_by_ip,
+                    &mut endpoints,
+                )
                 {
                     if is_debug() {
                         eprintln!("debug: packet rejected from={from}: {e:#}");
@@ -152,67 +163,108 @@ fn handle_packet(
     bytes: &[u8],
     from: SocketAddr,
     peers_by_id: &HashMap<NodeId, PeerInfo>,
+    node_by_ip: &HashMap<std::net::Ipv4Addr, NodeId>,
     endpoints: &mut HashMap<NodeId, SocketAddr>,
 ) -> Result<()> {
     let pkt = decode_wire(bytes).context("decode wire")?;
-    if pkt.v != WIRE_VERSION || pkt.t != MsgType::Encrypted {
-        anyhow::bail!("unsupported wire version/type");
+
+    if pkt.v != WIRE_VERSION {
+        anyhow::bail!("unsupported wire version");
     }
 
-    let src_peer = peers_by_id.get(&pkt.src).context("unknown src node")?;
-    endpoints.insert(pkt.src, from);
-
-    // AAD binds routing header.
-    let aad = aad_bytes(pkt.v, pkt.t, pkt.src, pkt.dst);
-    let inner_bytes =
-        open(&src_peer.key, &pkt.nonce12, &pkt.ciphertext, &aad).context("decrypt inner")?;
-    let inner = decode_inner(&inner_bytes).context("decode inner")?;
-
-    match inner {
-        Inner::Register { virtual_ip } => {
-            let ip = virtual_ip.to_std();
-            if ip != src_peer.virt_ip {
-                anyhow::bail!("register ip mismatch");
+    match pkt.t {
+        MsgType::Control => {
+            if !pkt.dst.0.is_nil() {
+                anyhow::bail!("control packets must have nil dst");
             }
-            eprintln!(
-                "registered: node={} ip={} from={}",
-                src_peer.node.0, ip, from
-            );
-            Ok(())
+
+            let src_peer = peers_by_id.get(&pkt.src).context("unknown src node")?;
+            // Only update endpoints on authenticated control-plane packets.
+            endpoints.insert(pkt.src, from);
+
+            // AAD binds routing header.
+            let aad = aad_bytes(pkt.v, pkt.t, pkt.src, pkt.dst);
+            let pt = open(&src_peer.key, &pkt.nonce12, &pkt.ciphertext, &aad)
+                .context("decrypt control")?;
+            let ctrl = decode_control(&pt).context("decode control")?;
+
+            match ctrl {
+                Control::Register { virtual_ip } => {
+                    let ip = virtual_ip.to_std();
+                    if ip != src_peer.virt_ip {
+                        anyhow::bail!("register ip mismatch");
+                    }
+                    eprintln!(
+                        "registered: node={} ip={} from={}",
+                        src_peer.node.0, ip, from
+                    );
+                    Ok(())
+                }
+                Control::Keepalive => Ok(()),
+                Control::Resolve { virtual_ip } => {
+                    let ip = virtual_ip.to_std();
+                    let resp = match node_by_ip.get(&ip).copied() {
+                        Some(node_id) => Control::ResolveOk {
+                            virtual_ip: Ipv4AddrBytes::from_std(ip),
+                            node_id,
+                        },
+                        None => Control::ResolveErr {
+                            virtual_ip: Ipv4AddrBytes::from_std(ip),
+                        },
+                    };
+
+                    // Reply to requester (dst=client node). Encrypt with the client's node key.
+                    let out_bytes = encode_control(&resp).context("encode control")?;
+                    let out_nonce = random_nonce12();
+                    let relay_id = NodeId(uuid::Uuid::nil());
+                    let out_aad = aad_bytes(WIRE_VERSION, MsgType::Control, relay_id, pkt.src);
+                    let out_ciphertext = seal(&src_peer.key, &out_nonce, &out_bytes, &out_aad)
+                        .context("encrypt control")?;
+
+                    let out_pkt = WirePacket {
+                        v: WIRE_VERSION,
+                        t: MsgType::Control,
+                        src: relay_id,
+                        dst: pkt.src,
+                        nonce12: out_nonce,
+                        ciphertext: out_ciphertext,
+                    };
+                    let out_wire = encode_wire(&out_pkt).context("encode wire")?;
+                    sock.send_to(&out_wire, from).context("udp send_to")?;
+                    Ok(())
+                }
+                Control::ResolveOk { .. } | Control::ResolveErr { .. } => {
+                    anyhow::bail!("unexpected resolve response from client")
+                }
+            }
         }
-        Inner::Keepalive => Ok(()),
-        Inner::Data { payload } => {
-            if payload.is_empty() {
-                anyhow::bail!("empty payload");
-            }
+
+        MsgType::Data => {
             if pkt.dst.0.is_nil() {
                 anyhow::bail!("data requires non-nil dst");
             }
+            if !peers_by_id.contains_key(&pkt.src) {
+                anyhow::bail!("unknown src node");
+            }
+            if !peers_by_id.contains_key(&pkt.dst) {
+                anyhow::bail!("unknown dst node");
+            }
 
-            let dst_peer = peers_by_id.get(&pkt.dst).context("unknown dst node")?;
+            let expected_from = endpoints
+                .get(&pkt.src)
+                .copied()
+                .context("no endpoint for src (has it registered yet?)")?;
+            if expected_from != from {
+                anyhow::bail!("src endpoint mismatch (spoof?)");
+            }
+
             let dst_addr = endpoints
                 .get(&pkt.dst)
                 .copied()
-                .context("no endpoint for dst (has it connected yet?)")?;
+                .context("no endpoint for dst (has it registered yet?)")?;
 
-            let out_inner = Inner::Data { payload };
-            let out_inner_bytes = encode_inner(&out_inner).context("encode inner")?;
-            let out_nonce = random_nonce12();
-            let out_aad = aad_bytes(WIRE_VERSION, MsgType::Encrypted, pkt.src, pkt.dst);
-            let out_ciphertext =
-                seal(&dst_peer.key, &out_nonce, &out_inner_bytes, &out_aad).context("encrypt")?;
-
-            let out_pkt = WirePacket {
-                v: WIRE_VERSION,
-                t: MsgType::Encrypted,
-                src: pkt.src,
-                dst: pkt.dst,
-                nonce12: out_nonce,
-                ciphertext: out_ciphertext,
-            };
-
-            let out_bytes = encode_wire(&out_pkt).context("encode wire")?;
-            sock.send_to(&out_bytes, dst_addr).context("udp send_to")?;
+            // Forward opaquely; relay never decrypts MsgType::Data.
+            sock.send_to(bytes, dst_addr).context("udp send_to")?;
             Ok(())
         }
     }
