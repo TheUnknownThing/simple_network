@@ -121,7 +121,6 @@ fn run(config_path: &str) -> Result<()> {
 
     let sock = std::net::UdpSocket::bind(&cfg.listen)
         .with_context(|| format!("binding UDP socket on {}", cfg.listen))?;
-    sock.set_nonblocking(true).context("set UDP nonblocking")?;
     eprintln!(
         "relay started: listen={} peers={}",
         cfg.listen,
@@ -131,28 +130,25 @@ fn run(config_path: &str) -> Result<()> {
     let mut endpoints: HashMap<NodeId, SocketAddr> = HashMap::new();
     let mut buf = vec![0u8; 2048];
     loop {
-        match sock.recv_from(&mut buf) {
-            Ok((n, from)) => {
-                if let Err(e) = handle_packet(
-                    &sock,
-                    &buf[..n],
-                    from,
-                    &peers_by_id,
-                    &node_by_ip,
-                    &mut endpoints,
-                )
-                {
-                    if is_debug() {
-                        eprintln!("debug: packet rejected from={from}: {e:#}");
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(v) => v,
             Err(e) => {
                 eprintln!("warn: recv_from failed: {e}");
                 std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+
+        if let Err(e) = handle_packet(
+            &sock,
+            &buf[..n],
+            from,
+            &peers_by_id,
+            &node_by_ip,
+            &mut endpoints,
+        ) {
+            if is_debug() {
+                eprintln!("debug: packet rejected from={from}: {e:#}");
             }
         }
     }

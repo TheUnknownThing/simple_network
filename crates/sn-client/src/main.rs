@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use crossbeam_channel as channel;
 use serde::Deserialize;
 
 use sn_proto::crypto::{decode_psk_base64, derive_e2e_key, derive_node_key, open, random_nonce12, seal};
@@ -231,7 +231,6 @@ fn run(config_path: &str) -> Result<()> {
 
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").context("binding UDP")?;
     sock.connect(server_addr).context("connecting UDP")?;
-    sock.set_nonblocking(true).context("set UDP nonblocking")?;
 
     eprintln!(
         "client started: node={} ip={} server={}",
@@ -249,9 +248,11 @@ fn run(config_path: &str) -> Result<()> {
         },
     )?;
 
-    // Use blocking threads for TUN I/O (small + works well on routers).
-    let (tun_tx, tun_rx) = mpsc::sync_channel::<Vec<u8>>(256);
-    let (net_tx, net_rx) = mpsc::sync_channel::<Vec<u8>>(256);
+    // Use blocking threads for TUN I/O and UDP receive.
+    // Main thread remains event-driven (no polling sleeps).
+    let (tun_tx, tun_rx) = channel::bounded::<Vec<u8>>(256);
+    let (net_tx, net_rx) = channel::bounded::<Vec<u8>>(256);
+    let (udp_tx, udp_rx) = channel::bounded::<Vec<u8>>(256);
 
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 2000];
@@ -300,8 +301,27 @@ fn run(config_path: &str) -> Result<()> {
         }
     });
 
-    let mut udp_buf = vec![0u8; 2048];
-    let mut next_keepalive = Instant::now() + Duration::from_secs(20);
+    let sock_rx = sock.try_clone().context("cloning UDP socket")?;
+    std::thread::spawn(move || {
+        let mut udp_buf = vec![0u8; 2048];
+        loop {
+            match sock_rx.recv(&mut udp_buf) {
+                Ok(n) if n > 0 => {
+                    if udp_tx.send(udp_buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    eprintln!("warn: udp recv failed: {e}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    });
+
+    let keepalive_tick = channel::tick(Duration::from_secs(20));
 
     let mut pending_by_ip: HashMap<std::net::Ipv4Addr, Vec<Vec<u8>>> = HashMap::new();
     let mut last_resolve_sent: HashMap<std::net::Ipv4Addr, Instant> = HashMap::new();
@@ -309,63 +329,62 @@ fn run(config_path: &str) -> Result<()> {
     const RESOLVE_RETRY: Duration = Duration::from_secs(2);
 
     loop {
-        // Keepalive.
-        if Instant::now() >= next_keepalive {
-            let _ = send_control(
-                &sock,
-                node_id,
-                NodeId(uuid::Uuid::nil()),
-                &node_key,
-                Control::Keepalive,
-            );
-            next_keepalive = Instant::now() + Duration::from_secs(20);
-        }
-
-        // Drain TUN packets.
-        while let Ok(pkt) = tun_rx.try_recv() {
-            // Minimal IPv4 parsing: destination at bytes 16..20.
-            if pkt.len() < 20 {
-                continue;
-            }
-            let dst_ip = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-
-            if let Some(dst_node) = node_by_ip.get(&dst_ip).copied() {
-                send_data(&sock, node_id, dst_node, &network_psk, &pkt)?;
-                continue;
-            }
-
-            let entry = pending_by_ip.entry(dst_ip).or_default();
-            if entry.len() < MAX_PENDING_PER_IP {
-                entry.push(pkt);
-            } else if is_debug() {
-                eprintln!("debug: pending queue full for dst={dst_ip}");
-            }
-
-            let now = Instant::now();
-            let should_send = match last_resolve_sent.get(&dst_ip) {
-                Some(t) => now.duration_since(*t) >= RESOLVE_RETRY,
-                None => true,
-            };
-            if should_send {
+        channel::select! {
+            recv(keepalive_tick) -> _ => {
                 let _ = send_control(
                     &sock,
                     node_id,
                     NodeId(uuid::Uuid::nil()),
                     &node_key,
-                    Control::Resolve {
-                        virtual_ip: Ipv4AddrBytes::from_std(dst_ip),
-                    },
+                    Control::Keepalive,
                 );
-                last_resolve_sent.insert(dst_ip, now);
             }
-        }
 
-        // UDP receive.
-        match sock.recv(&mut udp_buf) {
-            Ok(n) => {
+            recv(tun_rx) -> pkt => {
+                let Ok(pkt) = pkt else { return Ok(()); };
+
+                // Minimal IPv4 parsing: destination at bytes 16..20.
+                if pkt.len() < 20 {
+                    continue;
+                }
+                let dst_ip = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+
+                if let Some(dst_node) = node_by_ip.get(&dst_ip).copied() {
+                    send_data(&sock, node_id, dst_node, &network_psk, &pkt)?;
+                    continue;
+                }
+
+                let entry = pending_by_ip.entry(dst_ip).or_default();
+                if entry.len() < MAX_PENDING_PER_IP {
+                    entry.push(pkt);
+                } else if is_debug() {
+                    eprintln!("debug: pending queue full for dst={dst_ip}");
+                }
+
+                let now = Instant::now();
+                let should_send = match last_resolve_sent.get(&dst_ip) {
+                    Some(t) => now.duration_since(*t) >= RESOLVE_RETRY,
+                    None => true,
+                };
+                if should_send {
+                    let _ = send_control(
+                        &sock,
+                        node_id,
+                        NodeId(uuid::Uuid::nil()),
+                        &node_key,
+                        Control::Resolve {
+                            virtual_ip: Ipv4AddrBytes::from_std(dst_ip),
+                        },
+                    );
+                    last_resolve_sent.insert(dst_ip, now);
+                }
+            }
+
+            recv(udp_rx) -> bytes => {
+                let Ok(bytes) = bytes else { return Ok(()); };
                 if let Err(e) = handle_inbound(
                     &sock,
-                    &udp_buf[..n],
+                    &bytes,
                     node_id,
                     &node_key,
                     &network_psk,
@@ -378,13 +397,6 @@ fn run(config_path: &str) -> Result<()> {
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) => {
-                eprintln!("warn: udp recv failed: {e}");
-                std::thread::sleep(Duration::from_millis(20));
-            }
         }
     }
 }
@@ -395,7 +407,7 @@ fn handle_inbound(
     node_id: NodeId,
     node_key: &[u8; 32],
     network_psk: &[u8; 32],
-    net_tx: &mpsc::SyncSender<Vec<u8>>,
+    net_tx: &channel::Sender<Vec<u8>>,
     node_by_ip: &mut HashMap<std::net::Ipv4Addr, NodeId>,
     pending_by_ip: &mut HashMap<std::net::Ipv4Addr, Vec<Vec<u8>>>,
 ) -> Result<()> {
