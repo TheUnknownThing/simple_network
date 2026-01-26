@@ -7,7 +7,10 @@ use anyhow::{Context, Result};
 use crossbeam_channel as channel;
 use serde::Deserialize;
 
-use sn_proto::crypto::{decode_psk_base64, derive_e2e_key, derive_node_key, open, random_nonce12, seal};
+use sn_proto::crypto::{
+    decode_psk_base64, derive_e2e_key, derive_node_key, open, random_nonce12, seal,
+};
+use sn_proto::framing::{encode_frames_to_buffer, read_frame, DEFAULT_MAX_FRAME_LEN};
 use sn_proto::wire::{
     decode_control, decode_wire, encode_control, encode_wire, Control, Ipv4AddrBytes, MsgType,
     NodeId, WirePacket, WIRE_VERSION,
@@ -31,7 +34,11 @@ fn u32_to_ipv4(v: u32) -> std::net::Ipv4Addr {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_ensure_route(dev: &str, virt_ip: std::net::Ipv4Addr, netmask: std::net::Ipv4Addr) -> anyhow::Result<()> {
+fn macos_ensure_route(
+    dev: &str,
+    virt_ip: std::net::Ipv4Addr,
+    netmask: std::net::Ipv4Addr,
+) -> anyhow::Result<()> {
     use std::process::Command;
 
     let network = u32_to_ipv4(ipv4_to_u32(virt_ip) & ipv4_to_u32(netmask));
@@ -67,6 +74,8 @@ fn macos_ensure_route(dev: &str, virt_ip: std::net::Ipv4Addr, netmask: std::net:
 #[derive(Debug, Deserialize)]
 struct ClientConfig {
     server: String,
+    #[serde(default)]
+    transport: Option<String>,
     node_id: String,
     virtual_ip: String,
     #[serde(default)]
@@ -79,6 +88,50 @@ struct ClientConfig {
     /// Optional. If omitted, falls back to relay_psk_base64 (reduces E2E security).
     #[serde(default)]
     network_psk_base64: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transport {
+    Udp,
+    Tcp,
+}
+
+impl Transport {
+    fn parse(v: Option<&str>) -> anyhow::Result<Self> {
+        match v.unwrap_or("udp").trim().to_ascii_lowercase().as_str() {
+            "udp" => Ok(Self::Udp),
+            "tcp" => Ok(Self::Tcp),
+            other => anyhow::bail!("unsupported transport: {other} (expected udp|tcp)"),
+        }
+    }
+}
+
+trait NetOut: Send + Sync {
+    fn send(&self, bytes: Vec<u8>) -> anyhow::Result<()>;
+}
+
+struct UdpOut {
+    sock: std::net::UdpSocket,
+}
+
+impl NetOut for UdpOut {
+    fn send(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.sock.send(&bytes).context("udp send")?;
+        Ok(())
+    }
+}
+
+struct TcpOut {
+    tx: channel::Sender<Vec<u8>>,
+}
+
+impl NetOut for TcpOut {
+    fn send(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.tx
+            .send(bytes)
+            .map_err(|_| anyhow::anyhow!("tcp send channel closed"))?;
+        Ok(())
+    }
 }
 
 fn main() -> Result<()> {
@@ -151,6 +204,7 @@ fn run(config_path: &str) -> Result<()> {
     let cfg: ClientConfig = toml::from_str(&cfg_text).context("parsing client config")?;
 
     let server_addr: SocketAddr = cfg.server.parse().context("parsing server addr")?;
+    let transport = Transport::parse(cfg.transport.as_deref())?;
     let node_uuid = uuid::Uuid::parse_str(&cfg.node_id).context("parsing node_id")?;
     let node_id = NodeId(node_uuid);
 
@@ -229,17 +283,111 @@ fn run(config_path: &str) -> Result<()> {
 
     let (mut tun_reader, mut tun_writer) = dev.split();
 
-    let sock = std::net::UdpSocket::bind("0.0.0.0:0").context("binding UDP")?;
-    sock.connect(server_addr).context("connecting UDP")?;
+    let (net_in_tx, net_in_rx) = channel::bounded::<Vec<u8>>(256);
+    let net_out: Box<dyn NetOut> = match transport {
+        Transport::Udp => {
+            let sock = std::net::UdpSocket::bind("0.0.0.0:0").context("binding UDP")?;
+            sock.connect(server_addr).context("connecting UDP")?;
+
+            let sock_rx = sock.try_clone().context("cloning UDP socket")?;
+            let net_in_tx = net_in_tx.clone();
+            std::thread::spawn(move || {
+                let mut udp_buf = vec![0u8; 2048];
+                loop {
+                    match sock_rx.recv(&mut udp_buf) {
+                        Ok(n) if n > 0 => {
+                            if net_in_tx.send(udp_buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            eprintln!("warn: udp recv failed: {e}");
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                    }
+                }
+            });
+
+            Box::new(UdpOut { sock })
+        }
+
+        Transport::Tcp => {
+            let stream = std::net::TcpStream::connect(server_addr).context("connecting TCP")?;
+            let _ = stream.set_nodelay(true);
+
+            let mut reader = stream
+                .try_clone()
+                .context("cloning TCP stream for reader")?;
+            let mut writer = stream;
+
+            let net_in_tx = net_in_tx.clone();
+            std::thread::spawn(move || loop {
+                match read_frame(&mut reader, DEFAULT_MAX_FRAME_LEN) {
+                    Ok(frame) => {
+                        if net_in_tx.send(frame).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => {
+                        eprintln!("warn: tcp read failed: {e}");
+                        break;
+                    }
+                }
+            });
+
+            let (tcp_tx, tcp_rx) = channel::bounded::<Vec<u8>>(1024);
+            std::thread::spawn(move || {
+                use std::io::Write;
+
+                const MAX_BATCH_FRAMES: usize = 64;
+                const MAX_BATCH_BYTES: usize = 256 * 1024;
+
+                let mut buf_writer = std::io::BufWriter::new(&mut writer);
+                while let Ok(first) = tcp_rx.recv() {
+                    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(8);
+                    let mut bytes_total = first.len();
+                    frames.push(first);
+
+                    while frames.len() < MAX_BATCH_FRAMES && bytes_total < MAX_BATCH_BYTES {
+                        match tcp_rx.try_recv() {
+                            Ok(next) => {
+                                bytes_total = bytes_total.saturating_add(next.len());
+                                frames.push(next);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    let out = match encode_frames_to_buffer(&frames) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("warn: tcp batch encode failed: {e}");
+                            break;
+                        }
+                    };
+
+                    if let Err(e) = buf_writer.write_all(&out).and_then(|_| buf_writer.flush()) {
+                        eprintln!("warn: tcp write failed: {e}");
+                        break;
+                    }
+                }
+            });
+
+            Box::new(TcpOut { tx: tcp_tx })
+        }
+    };
 
     eprintln!(
-        "client started: node={} ip={} server={}",
-        node_id.0, virt_ip, server_addr
+        "client started: node={} ip={} server={} transport={:?}",
+        node_id.0, virt_ip, server_addr, transport
     );
 
     // Register.
     send_control(
-        &sock,
+        net_out.as_ref(),
         node_id,
         NodeId(uuid::Uuid::nil()),
         &node_key,
@@ -252,7 +400,6 @@ fn run(config_path: &str) -> Result<()> {
     // Main thread remains event-driven (no polling sleeps).
     let (tun_tx, tun_rx) = channel::bounded::<Vec<u8>>(256);
     let (net_tx, net_rx) = channel::bounded::<Vec<u8>>(256);
-    let (udp_tx, udp_rx) = channel::bounded::<Vec<u8>>(256);
 
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 2000];
@@ -301,26 +448,6 @@ fn run(config_path: &str) -> Result<()> {
         }
     });
 
-    let sock_rx = sock.try_clone().context("cloning UDP socket")?;
-    std::thread::spawn(move || {
-        let mut udp_buf = vec![0u8; 2048];
-        loop {
-            match sock_rx.recv(&mut udp_buf) {
-                Ok(n) if n > 0 => {
-                    if udp_tx.send(udp_buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    eprintln!("warn: udp recv failed: {e}");
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-    });
-
     let keepalive_tick = channel::tick(Duration::from_secs(20));
 
     let mut pending_by_ip: HashMap<std::net::Ipv4Addr, Vec<Vec<u8>>> = HashMap::new();
@@ -332,7 +459,7 @@ fn run(config_path: &str) -> Result<()> {
         channel::select! {
             recv(keepalive_tick) -> _ => {
                 let _ = send_control(
-                    &sock,
+                    net_out.as_ref(),
                     node_id,
                     NodeId(uuid::Uuid::nil()),
                     &node_key,
@@ -350,7 +477,7 @@ fn run(config_path: &str) -> Result<()> {
                 let dst_ip = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
 
                 if let Some(dst_node) = node_by_ip.get(&dst_ip).copied() {
-                    send_data(&sock, node_id, dst_node, &network_psk, &pkt)?;
+                    send_data(net_out.as_ref(), node_id, dst_node, &network_psk, &pkt)?;
                     continue;
                 }
 
@@ -368,7 +495,7 @@ fn run(config_path: &str) -> Result<()> {
                 };
                 if should_send {
                     let _ = send_control(
-                        &sock,
+                        net_out.as_ref(),
                         node_id,
                         NodeId(uuid::Uuid::nil()),
                         &node_key,
@@ -380,10 +507,10 @@ fn run(config_path: &str) -> Result<()> {
                 }
             }
 
-            recv(udp_rx) -> bytes => {
+            recv(net_in_rx) -> bytes => {
                 let Ok(bytes) = bytes else { return Ok(()); };
                 if let Err(e) = handle_inbound(
-                    &sock,
+                    net_out.as_ref(),
                     &bytes,
                     node_id,
                     &node_key,
@@ -402,7 +529,7 @@ fn run(config_path: &str) -> Result<()> {
 }
 
 fn handle_inbound(
-    sock: &std::net::UdpSocket,
+    out: &dyn NetOut,
     bytes: &[u8],
     node_id: NodeId,
     node_key: &[u8; 32],
@@ -422,17 +549,21 @@ fn handle_inbound(
     match pkt.t {
         MsgType::Control => {
             let aad = aad_bytes(pkt.v, pkt.t, pkt.src, pkt.dst);
-            let pt = open(node_key, &pkt.nonce12, &pkt.ciphertext, &aad).context("decrypt control")?;
+            let pt =
+                open(node_key, &pkt.nonce12, &pkt.ciphertext, &aad).context("decrypt control")?;
             let ctrl = decode_control(&pt).context("decode control")?;
 
             match ctrl {
-                Control::ResolveOk { virtual_ip, node_id: peer } => {
+                Control::ResolveOk {
+                    virtual_ip,
+                    node_id: peer,
+                } => {
                     let ip = virtual_ip.to_std();
                     node_by_ip.insert(ip, peer);
 
                     if let Some(mut queued) = pending_by_ip.remove(&ip) {
                         for pkt in queued.drain(..) {
-                            let _ = send_data(sock, node_id, peer, network_psk, &pkt);
+                            let _ = send_data(out, node_id, peer, network_psk, &pkt);
                         }
                     }
                     Ok(())
@@ -450,7 +581,8 @@ fn handle_inbound(
         MsgType::Data => {
             let e2e_key = derive_e2e_key(network_psk, pkt.src, pkt.dst);
             let aad = aad_bytes(pkt.v, pkt.t, pkt.src, pkt.dst);
-            let payload = open(&e2e_key, &pkt.nonce12, &pkt.ciphertext, &aad).context("decrypt data")?;
+            let payload =
+                open(&e2e_key, &pkt.nonce12, &pkt.ciphertext, &aad).context("decrypt data")?;
             if payload.is_empty() {
                 anyhow::bail!("empty payload");
             }
@@ -461,7 +593,7 @@ fn handle_inbound(
 }
 
 fn send_control(
-    sock: &std::net::UdpSocket,
+    out: &dyn NetOut,
     src: NodeId,
     dst: NodeId,
     node_key: &[u8; 32],
@@ -482,12 +614,12 @@ fn send_control(
     };
 
     let bytes = encode_wire(&pkt).context("encode wire")?;
-    sock.send(&bytes).context("udp send")?;
+    out.send(bytes)?;
     Ok(())
 }
 
 fn send_data(
-    sock: &std::net::UdpSocket,
+    out: &dyn NetOut,
     src: NodeId,
     dst: NodeId,
     network_psk: &[u8; 32],
@@ -508,7 +640,7 @@ fn send_data(
     };
 
     let bytes = encode_wire(&pkt).context("encode wire")?;
-    sock.send(&bytes).context("udp send")?;
+    out.send(bytes)?;
     Ok(())
 }
 

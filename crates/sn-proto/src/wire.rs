@@ -58,7 +58,10 @@ pub enum Control {
     /// Client -> relay: resolve a virtual IPv4 to a node_id.
     Resolve { virtual_ip: Ipv4AddrBytes },
     /// Relay -> client: resolution succeeded.
-    ResolveOk { virtual_ip: Ipv4AddrBytes, node_id: NodeId },
+    ResolveOk {
+        virtual_ip: Ipv4AddrBytes,
+        node_id: NodeId,
+    },
     /// Relay -> client: resolution failed.
     ResolveErr { virtual_ip: Ipv4AddrBytes },
 }

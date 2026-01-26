@@ -1,4 +1,5 @@
 server = "127.0.0.1:41641"
+transport = "udp" # or "tcp"
 node_id = "00000000-0000-0000-0000-000000000002"
 virtual_ip = "10.0.0.2"
 # Linux: set an arbitrary name like "sn0".

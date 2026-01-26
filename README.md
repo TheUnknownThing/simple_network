@@ -4,7 +4,7 @@ Minimal relay-based encrypted overlay network.
 
 This workspace contains:
 
-- `sn-relay`: UDP relay server (star topology)
+- `sn-relay`: relay server (UDP or TCP; star topology)
 - `sn-client`: client that creates a TUN device and tunnels IPv4 packets through the relay (Linux/macOS)
 - `sn-proto`: wire format + crypto helpers
 
@@ -13,7 +13,12 @@ This workspace contains:
 - Each client creates a TUN interface (e.g. `sn0`) with a **virtual IPv4** like `10.0.0.2`.
 - When the OS sends a packet to some virtual destination (e.g. `10.0.0.3`), the client reads it from the TUN device.
 - The client wraps that packet in an end-to-end encrypted message and sends it via UDP to the relay.
-- The relay tracks the UDP source address of each node (learned from authenticated registration) and forwards traffic to the destination node **without decrypting**.
+- The relay forwards traffic to the destination node **without decrypting**.
+
+Transport options:
+
+- `udp` (default): original design; low overhead and NAT-friendly.
+- `tcp`: uses a length-prefixed stream framing layer; can be beneficial on some networks and for long-lived flows.
 
 ### Security note
 
@@ -34,7 +39,8 @@ The repo includes `configs/*.example.toml`.
 
 In `sn-client` config:
 
-- `server` (string): UDP relay address, e.g. `"1.2.3.4:41641"`
+- `server` (string): relay address, e.g. `"1.2.3.4:41641"`
+- `transport` (optional, string): `"udp"` (default) or `"tcp"`
 - `node_id` (UUID string): unique per node
 - `virtual_ip` (IPv4 string): IP assigned to the node on the overlay
 - `tun` (string): TUN device name.
@@ -49,7 +55,8 @@ In `sn-client` config:
 
 In `sn-relay` config:
 
-- `listen` (string): UDP bind address, e.g. `"0.0.0.0:41641"`
+- `listen` (string): bind address, e.g. `"0.0.0.0:41641"`
+- `transport` (optional, string): `"udp"` (default) or `"tcp"`
 - `relay_psk_base64` (base64 string): 32-byte shared secret for relay control-plane (must match clients)
 - `peers` (table): map `"<peer uuid>" = "10.0.0.X"`
 
