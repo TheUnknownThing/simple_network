@@ -18,7 +18,10 @@ This workspace contains:
 Transport options:
 
 - `udp` (default): original design; low overhead and NAT-friendly.
-- `tcp`: uses a length-prefixed stream framing layer; can be beneficial on some networks and for long-lived flows.
+- `tcp`: uses a length-prefixed stream framing layer.
+	- Note: TCP has head-of-line blocking. Under packet loss, latency-sensitive UDP apps (e.g. game streaming) can see higher latency when tunneled over TCP.
+	- To keep latency bounded, the implementation may drop data-plane frames when the TCP send queue is congested (control-plane remains best-effort reliable).
+- `both`: relay listens on both UDP and TCP so each client can pick independently.
 
 ### Security note
 
@@ -56,7 +59,7 @@ In `sn-client` config:
 In `sn-relay` config:
 
 - `listen` (string): bind address, e.g. `"0.0.0.0:41641"`
-- `transport` (optional, string): `"udp"` (default) or `"tcp"`
+- `transport` (optional, string): `"udp"` (default), `"tcp"`, or `"both"`
 - `relay_psk_base64` (base64 string): 32-byte shared secret for relay control-plane (must match clients)
 - `peers` (table): map `"<peer uuid>" = "10.0.0.X"`
 

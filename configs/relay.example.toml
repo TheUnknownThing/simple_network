@@ -1,5 +1,5 @@
 listen = "0.0.0.0:41641"
-transport = "udp" # or "tcp"
+transport = "both" # "udp" | "tcp" | "both"
 # 32 bytes base64. Example only; generate your own:
 relay_psk_base64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 

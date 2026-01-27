@@ -107,7 +107,13 @@ impl Transport {
 }
 
 trait NetOut: Send + Sync {
-    fn send(&self, bytes: Vec<u8>) -> anyhow::Result<()>;
+    fn send(&self, kind: OutKind, bytes: Vec<u8>) -> anyhow::Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutKind {
+    Control,
+    Data,
 }
 
 struct UdpOut {
@@ -115,22 +121,38 @@ struct UdpOut {
 }
 
 impl NetOut for UdpOut {
-    fn send(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
+    fn send(&self, _kind: OutKind, bytes: Vec<u8>) -> anyhow::Result<()> {
         self.sock.send(&bytes).context("udp send")?;
         Ok(())
     }
 }
 
 struct TcpOut {
-    tx: channel::Sender<Vec<u8>>,
+    tx_control: channel::Sender<Vec<u8>>,
+    tx_data: channel::Sender<Vec<u8>>,
 }
 
 impl NetOut for TcpOut {
-    fn send(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
-        self.tx
-            .send(bytes)
-            .map_err(|_| anyhow::anyhow!("tcp send channel closed"))?;
-        Ok(())
+    fn send(&self, kind: OutKind, bytes: Vec<u8>) -> anyhow::Result<()> {
+        match kind {
+            OutKind::Control => {
+                self.tx_control
+                    .send(bytes)
+                    .map_err(|_| anyhow::anyhow!("tcp control channel closed"))?;
+                Ok(())
+            }
+            OutKind::Data => {
+                // For real-time traffic (e.g. game streaming), prefer dropping rather than
+                // queueing behind TCP backpressure, which manifests as high latency.
+                match self.tx_data.try_send(bytes) {
+                    Ok(()) => Ok(()),
+                    Err(channel::TrySendError::Full(_)) => Ok(()),
+                    Err(channel::TrySendError::Disconnected(_)) => {
+                        Err(anyhow::anyhow!("tcp data channel closed"))
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -338,21 +360,55 @@ fn run(config_path: &str) -> Result<()> {
                 }
             });
 
-            let (tcp_tx, tcp_rx) = channel::bounded::<Vec<u8>>(1024);
+            // Separate channels so control traffic remains responsive under data congestion.
+            let (tcp_ctl_tx, tcp_ctl_rx) = channel::bounded::<Vec<u8>>(128);
+            let (tcp_data_tx, tcp_data_rx) = channel::bounded::<Vec<u8>>(2048);
             std::thread::spawn(move || {
                 use std::io::Write;
 
-                const MAX_BATCH_FRAMES: usize = 64;
-                const MAX_BATCH_BYTES: usize = 256 * 1024;
+                // Keep batches small to avoid adding latency.
+                const MAX_BATCH_FRAMES: usize = 16;
+                const MAX_BATCH_BYTES: usize = 64 * 1024;
 
-                let mut buf_writer = std::io::BufWriter::new(&mut writer);
-                while let Ok(first) = tcp_rx.recv() {
+                loop {
+                    // Prefer control frames if present.
                     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(8);
-                    let mut bytes_total = first.len();
-                    frames.push(first);
+                    let mut bytes_total = 0usize;
+
+                    while let Ok(f) = tcp_ctl_rx.try_recv() {
+                        bytes_total = bytes_total.saturating_add(f.len());
+                        frames.push(f);
+                        if frames.len() >= MAX_BATCH_FRAMES || bytes_total >= MAX_BATCH_BYTES {
+                            break;
+                        }
+                    }
+
+                    if frames.is_empty() {
+                        channel::select! {
+                            recv(tcp_ctl_rx) -> v => {
+                                let Ok(v) = v else { break; };
+                                bytes_total = v.len();
+                                frames.push(v);
+                            }
+                            recv(tcp_data_rx) -> v => {
+                                let Ok(v) = v else { break; };
+                                bytes_total = v.len();
+                                frames.push(v);
+                            }
+                        }
+                    }
 
                     while frames.len() < MAX_BATCH_FRAMES && bytes_total < MAX_BATCH_BYTES {
-                        match tcp_rx.try_recv() {
+                        // Drain any waiting control first.
+                        match tcp_ctl_rx.try_recv() {
+                            Ok(next) => {
+                                bytes_total = bytes_total.saturating_add(next.len());
+                                frames.push(next);
+                                continue;
+                            }
+                            Err(_) => {}
+                        }
+                        match tcp_data_rx.try_recv() {
                             Ok(next) => {
                                 bytes_total = bytes_total.saturating_add(next.len());
                                 frames.push(next);
@@ -369,14 +425,17 @@ fn run(config_path: &str) -> Result<()> {
                         }
                     };
 
-                    if let Err(e) = buf_writer.write_all(&out).and_then(|_| buf_writer.flush()) {
+                    if let Err(e) = writer.write_all(&out) {
                         eprintln!("warn: tcp write failed: {e}");
                         break;
                     }
                 }
             });
 
-            Box::new(TcpOut { tx: tcp_tx })
+            Box::new(TcpOut {
+                tx_control: tcp_ctl_tx,
+                tx_data: tcp_data_tx,
+            })
         }
     };
 
@@ -614,7 +673,7 @@ fn send_control(
     };
 
     let bytes = encode_wire(&pkt).context("encode wire")?;
-    out.send(bytes)?;
+    out.send(OutKind::Control, bytes)?;
     Ok(())
 }
 
@@ -640,7 +699,7 @@ fn send_data(
     };
 
     let bytes = encode_wire(&pkt).context("encode wire")?;
-    out.send(bytes)?;
+    out.send(OutKind::Data, bytes)?;
     Ok(())
 }
 
